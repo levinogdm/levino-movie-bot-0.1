@@ -401,7 +401,7 @@ async def request_confirm_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer("✅ Request submit cheythu!")
     await query.edit_message_text(
         f"✅ Request submit cheythu: '{req['query_text']}'\n\n"
-        f"Ee movie kittiyal njan automatic ayi DM ayakkam.\n\n{config.FOOTER}"
+        f"🫠 𝖾𝖾 𝗆𝗈𝗏𝗂𝖾 𝗄𝗂𝗍𝗍𝗂𝗒𝖺𝗅 𝗇𝗃𝖺𝗇 𝖺𝗎𝗍𝗈𝗆𝖺𝗍𝗂𝖼 𝖺𝗒𝗂 📩 𝗗𝗠 𝖺𝗒𝖺𝗄𝗄𝖺𝗆.\n\n{config.FOOTER}"
     )
 
 
