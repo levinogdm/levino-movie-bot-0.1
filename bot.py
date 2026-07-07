@@ -164,12 +164,22 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
     # verified (see deliver_file). Here we only ever send an IMAGE
     # (the admin's poster photo, or the file's own auto-thumbnail) or,
     # if neither exists, plain text — never send_video/send_document.
-    image_to_use = poster_file_id or thumb_file_id
-
     try:
-        if image_to_use:
+        if poster_file_id:
+            # A real poster photo's file_id can be reused directly.
             await context.bot.send_photo(
-                config.MAIN_CHANNEL_ID, image_to_use, caption=caption,
+                config.MAIN_CHANNEL_ID, poster_file_id, caption=caption,
+                parse_mode=ParseMode.HTML, reply_markup=button,
+            )
+        elif thumb_file_id:
+            # Telegram does NOT allow a video/document's "thumbnail" file_id
+            # to be reused directly as a photo (different internal file
+            # type), so we download the thumbnail's bytes first and then
+            # upload it fresh as a brand-new photo.
+            tg_file = await context.bot.get_file(thumb_file_id)
+            photo_bytes = await tg_file.download_as_bytearray()
+            await context.bot.send_photo(
+                config.MAIN_CHANNEL_ID, bytes(photo_bytes), caption=caption,
                 parse_mode=ParseMode.HTML, reply_markup=button,
             )
         else:
