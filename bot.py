@@ -247,6 +247,71 @@ async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("❌ Ninnal ippozhum channel join cheythittilla!", show_alert=True)
 
 
+# ---------------- Search by movie name (DM only) ----------------
+# User types a movie name directly to the bot in DM. The bot searches all
+# titles ever posted from the private channel and, if the user has joined
+# the main channel, delivers the matching file the same way deliver_file
+# always does (fresh from the bot, auto-deletes after AUTO_DELETE_SECONDS).
+
+async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query_text = update.message.text.strip()
+    if not query_text:
+        return
+
+    user = update.effective_user
+    db.add_user(user.id, user.username, user.first_name)
+
+    results = db.search_files(query_text)
+    if not results:
+        await update.message.reply_text(
+            f"😔 '{query_text}' ennu match aavunna movie kandilla.\n\n{config.FOOTER}"
+        )
+        return
+
+    if not await is_joined(context.bot, user.id):
+        if len(results) == 1:
+            # Single match — reuse the same join-then-deliver flow as /start deep links.
+            await update.message.reply_text(
+                f"⚠️ Ee movie edukkan main channel join cheyyanam.\n\n{config.FOOTER}",
+                reply_markup=join_keyboard(results[0]["code"]),
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️ Movies edukkan main channel join cheyyanam. "
+                f"Join cheythu shesham veendum movie peru type cheyyuka.\n\n{config.FOOTER}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📢 Join Channel", url=config.MAIN_CHANNEL_LINK)
+                ]]),
+            )
+        return
+
+    if len(results) == 1:
+        await deliver_file(update.effective_chat.id, results[0]["code"], context)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(f"🎬 {r['title']}", callback_data=f"getfile_{r['code']}")]
+        for r in results
+    ]
+    await update.message.reply_text(
+        f"🔎 '{query_text}' -nu ee movies kittiyi, venda ondu select cheyyuka:\n\n{config.FOOTER}",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def getfile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    code = query.data.split("getfile_", 1)[1]
+    user_id = query.from_user.id
+
+    if not await is_joined(context.bot, user_id):
+        await query.answer("❌ Ninnal ippozhum channel join cheythittilla!", show_alert=True)
+        return
+
+    await query.answer()
+    await deliver_file(query.message.chat.id, code, context)
+
+
 # ---------------- Admin commands ----------------
 
 def admin_only(func):
@@ -323,7 +388,12 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern=r"^check_"))
+    app.add_handler(CallbackQueryHandler(getfile_callback, pattern=r"^getfile_"))
     app.add_handler(MessageHandler(filters.Chat(chat_id=config.PRIVATE_CHANNEL_ID), private_channel_handler))
+    # Any plain text a user sends the bot in DM (not a command) is treated
+    # as a movie name search. Must be added AFTER the private-channel
+    # handler above so channel posts are never mistaken for a search.
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, search_movie))
 
     app.add_error_handler(error_handler)
 
