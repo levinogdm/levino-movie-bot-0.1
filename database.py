@@ -1,16 +1,16 @@
 import sqlite3
 import secrets
 from datetime import datetime, timezone
- 
+
 DB_PATH = "bot_data.db"
- 
- 
+
+
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
- 
- 
+
+
 def init_db():
     conn = get_conn()
     c = conn.cursor()
@@ -33,12 +33,12 @@ def init_db():
     """)
     conn.commit()
     conn.close()
- 
- 
+
+
 def generate_code() -> str:
     return secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
- 
- 
+
+
 def save_file(file_id: str, file_type: str, title: str) -> str:
     conn = get_conn()
     c = conn.cursor()
@@ -54,8 +54,8 @@ def save_file(file_id: str, file_type: str, title: str) -> str:
     conn.commit()
     conn.close()
     return code
- 
- 
+
+
 def get_file(code: str):
     conn = get_conn()
     c = conn.cursor()
@@ -63,8 +63,21 @@ def get_file(code: str):
     row = c.fetchone()
     conn.close()
     return dict(row) if row else None
- 
- 
+
+
+def search_files(query: str, limit: int = 8):
+    conn = get_conn()
+    c = conn.cursor()
+    like_query = f"%{query.strip()}%"
+    c.execute(
+        "SELECT * FROM files WHERE title LIKE ? ORDER BY created_at DESC LIMIT ?",
+        (like_query, limit),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
 def add_user(user_id: int, username: str, first_name: str):
     conn = get_conn()
     c = conn.cursor()
@@ -76,8 +89,8 @@ def add_user(user_id: int, username: str, first_name: str):
         )
         conn.commit()
     conn.close()
- 
- 
+
+
 def get_all_user_ids():
     conn = get_conn()
     c = conn.cursor()
@@ -85,8 +98,8 @@ def get_all_user_ids():
     rows = c.fetchall()
     conn.close()
     return [r["user_id"] for r in rows]
- 
- 
+
+
 def get_stats():
     conn = get_conn()
     c = conn.cursor()
@@ -96,12 +109,11 @@ def get_stats():
     files = c.fetchone()["n"]
     conn.close()
     return {"users": users, "files": files}
- 
- 
+
+
 def remove_user(user_id: int):
     conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
- 
