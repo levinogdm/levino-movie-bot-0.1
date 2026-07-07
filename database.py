@@ -31,6 +31,19 @@ def init_db():
             joined_at TEXT
         )
     """)
+    # Movie requests: created as 'pending' the instant a search has no match,
+    # then flipped to 'requested' only once the user taps the confirm button
+    # (this avoids spamming the request channel with every failed search).
+    # Once a matching file is uploaded by the admin, status becomes 'fulfilled'.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            query_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -117,3 +130,77 @@ def remove_user(user_id: int):
     c.execute("DELETE FROM users WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
+
+
+# ---------------- Movie requests ----------------
+
+def create_request(user_id: int, query_text: str) -> int:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO requests (user_id, query_text, status, created_at) VALUES (?,?,?,?)",
+        (user_id, query_text, "pending", datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    req_id = c.lastrowid
+    conn.close()
+    return req_id
+
+
+def get_request(req_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM requests WHERE id=?", (req_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def confirm_request(req_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE requests SET status='requested' WHERE id=?", (req_id,))
+    conn.commit()
+    c.execute("SELECT * FROM requests WHERE id=?", (req_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_matching_requests(title: str):
+    """Find still-open ('requested') requests whose text overlaps the newly
+    uploaded movie's title, in either direction, so close-but-not-identical
+    wording still matches (e.g. request 'KGF 2' vs title 'KGF Chapter 2')."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM requests WHERE status='requested'")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    title_l = title.lower()
+    matches = []
+    for r in rows:
+        q = r["query_text"].lower()
+        if q in title_l or title_l in q:
+            matches.append(r)
+    return matches
+
+
+def mark_request_fulfilled(req_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE requests SET status='fulfilled' WHERE id=?", (req_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_pending_requests(limit: int = 30):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM requests WHERE status='requested' ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
