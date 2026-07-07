@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: movie-file-store-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: PRIVATE_CHANNEL_ID
+        sync: false
+      - key: MAIN_CHANNEL_ID
+        sync: false
+      - key: MAIN_CHANNEL_LINK
+        sync: false
+      - key: FORCE_SUB_CHANNEL_IDS
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: AUTO_DELETE_SECONDS
+        value: "120"
+ 

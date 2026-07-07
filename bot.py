@@ -1,0 +1,291 @@
+import logging
+import asyncio
+ 
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatMemberStatus, ParseMode
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters,
+)
+from telegram.error import TelegramError
+ 
+import config
+import database as db
+ 
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+ 
+# temporary buffer while collecting album items posted to the private channel
+media_groups: dict[str, list] = {}
+ 
+ 
+# ---------------- Helper functions ----------------
+ 
+async def is_joined(bot, user_id: int) -> bool:
+    for channel_id in config.FORCE_SUB_CHANNEL_IDS:
+        try:
+            member = await bot.get_chat_member(channel_id, user_id)
+            if member.status not in (
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER,
+            ):
+                return False
+        except TelegramError as e:
+            logger.warning(f"get_chat_member failed for {channel_id}: {e}")
+            return False
+    return True
+ 
+ 
+def join_keyboard(code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join Channel", url=config.MAIN_CHANNEL_LINK)],
+        [InlineKeyboardButton("✅ I've Joined", callback_data=f"check_{code}")],
+    ])
+ 
+ 
+async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id, message_id = context.job.data
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except TelegramError as e:
+        logger.info(f"Could not delete message {message_id} in {chat_id}: {e}")
+ 
+ 
+async def deliver_file(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE):
+    record = db.get_file(code)
+    if not record:
+        await context.bot.send_message(chat_id, f"⚠️ File kandilla / link expire aayi.\n\n{config.FOOTER}")
+        return
+ 
+    caption = (
+        f"🎬 {record['title']}\n\n"
+        f"⏳ Ee file {config.AUTO_DELETE_SECONDS // 60} minute kazhinjal automatic aayi delete aavum.\n\n"
+        f"{config.FOOTER}"
+    )
+ 
+    if record["file_type"] == "video":
+        sent = await context.bot.send_video(chat_id, record["file_id"], caption=caption)
+    elif record["file_type"] == "document":
+        sent = await context.bot.send_document(chat_id, record["file_id"], caption=caption)
+    else:
+        sent = await context.bot.send_photo(chat_id, record["file_id"], caption=caption)
+ 
+    context.job_queue.run_once(
+        delete_message_job, config.AUTO_DELETE_SECONDS, data=(chat_id, sent.message_id)
+    )
+ 
+ 
+# ---------------- Private channel: capture admin uploads ----------------
+# Admin workflow: send the poster PHOTO + the movie VIDEO/DOCUMENT together as one
+# album (select both in Telegram and send at once) to the PRIVATE channel.
+# Put the movie name in the photo's caption. The bot links them automatically.
+# (If you only send a video/document with a caption and no separate photo, that
+# file itself is used as the preview in the main channel.)
+ 
+async def process_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.sleep(2)  # give Telegram time to deliver every item in the album
+    messages = media_groups.pop(media_group_id, [])
+    if messages:
+        await handle_collected_messages(messages, context)
+ 
+ 
+async def handle_collected_messages(messages: list, context: ContextTypes.DEFAULT_TYPE):
+    poster_file_id = None
+    file_id = None
+    file_type = None
+    title = None
+ 
+    for msg in messages:
+        if msg.caption:
+            title = msg.caption.strip()
+        if msg.photo:
+            poster_file_id = msg.photo[-1].file_id
+        elif msg.video:
+            file_id = msg.video.file_id
+            file_type = "video"
+        elif msg.document:
+            file_id = msg.document.file_id
+            file_type = "document"
+ 
+    if not file_id:
+        return  # only a poster arrived, nothing to link yet
+ 
+    title = title or "Untitled"
+    code = db.save_file(file_id, file_type, title)
+ 
+    caption = f"🎬 <b>{title}</b>\n\n{config.FOOTER}"
+    button = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📥 Get Movie", url=f"https://t.me/{config.BOT_USERNAME}?start={code}")
+    ]])
+ 
+    try:
+        if poster_file_id:
+            await context.bot.send_photo(
+                config.MAIN_CHANNEL_ID, poster_file_id, caption=caption,
+                parse_mode=ParseMode.HTML, reply_markup=button,
+            )
+        elif file_type == "video":
+            await context.bot.send_video(
+                config.MAIN_CHANNEL_ID, file_id, caption=caption,
+                parse_mode=ParseMode.HTML, reply_markup=button,
+            )
+        else:
+            await context.bot.send_document(
+                config.MAIN_CHANNEL_ID, file_id, caption=caption,
+                parse_mode=ParseMode.HTML, reply_markup=button,
+            )
+    except TelegramError as e:
+        logger.error(f"Failed to post to main channel: {e}")
+ 
+ 
+async def private_channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.channel_post
+    if msg is None:
+        return
+ 
+    if msg.media_group_id:
+        group = media_groups.setdefault(msg.media_group_id, [])
+        group.append(msg)
+        if len(group) == 1:
+            context.application.create_task(process_group(msg.media_group_id, context))
+    else:
+        await handle_collected_messages([msg], context)
+ 
+ 
+# ---------------- User commands ----------------
+ 
+WELCOME_TEXT = (
+    "Hai! 🎬 Movie links ee bot vazhi share cheyyunnu.\n"
+    "Main channel-il oru movie post kanumbol, athinte 'Get Movie' button click cheyyuka.\n\n"
+    f"{config.FOOTER}"
+)
+ 
+ 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db.add_user(user.id, user.username, user.first_name)
+ 
+    if not context.args:
+        await update.message.reply_text(WELCOME_TEXT)
+        return
+ 
+    code = context.args[0]
+ 
+    if not await is_joined(context.bot, user.id):
+        await update.message.reply_text(
+            f"⚠️ Ee movie edukkan main channel join cheyyanam.\n\n{config.FOOTER}",
+            reply_markup=join_keyboard(code),
+        )
+        return
+ 
+    await deliver_file(update.effective_chat.id, code, context)
+ 
+ 
+async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    code = query.data.split("check_", 1)[1]
+    user_id = query.from_user.id
+ 
+    if await is_joined(context.bot, user_id):
+        await query.answer("✅ Confirm cheythu!")
+        await query.message.delete()
+        await deliver_file(query.message.chat.id, code, context)
+    else:
+        await query.answer("❌ Ninnal ippozhum channel join cheythittilla!", show_alert=True)
+ 
+ 
+# ---------------- Admin commands ----------------
+ 
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id not in config.ADMIN_IDS:
+            await update.message.reply_text("🚫 Ith admin command aanu.")
+            return
+        return await func(update, context)
+    return wrapper
+ 
+ 
+@admin_only
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🛠 Admin Panel\n\n"
+        "/stats - User & file statistics\n"
+        "/broadcast - (reply to a message) send it to all users\n\n"
+        f"{config.FOOTER}"
+    )
+    await update.message.reply_text(text)
+ 
+ 
+@admin_only
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = db.get_stats()
+    await update.message.reply_text(
+        f"👥 Total Users: {stats['users']}\n"
+        f"🎬 Total Files: {stats['files']}\n\n"
+        f"{config.FOOTER}"
+    )
+ 
+ 
+@admin_only
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Broadcast cheyyende message-nu reply cheythu /broadcast type cheyyuka.")
+        return
+ 
+    source = update.message.reply_to_message
+    user_ids = db.get_all_user_ids()
+    sent, failed = 0, 0
+ 
+    status_msg = await update.message.reply_text(f"Broadcasting to {len(user_ids)} users...")
+ 
+    for uid in user_ids:
+        try:
+            await source.copy(chat_id=uid)
+            sent += 1
+        except TelegramError:
+            failed += 1
+            db.remove_user(uid)
+        await asyncio.sleep(0.05)  # stay under Telegram's rate limits
+ 
+    await status_msg.edit_text(
+        f"✅ Broadcast complete.\nSent: {sent}\nFailed/removed: {failed}\n\n{config.FOOTER}"
+    )
+ 
+ 
+# ---------------- Error handler ----------------
+ 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Exception while handling update:", exc_info=context.error)
+ 
+ 
+# ---------------- Main ----------------
+ 
+def main():
+    db.init_db()
+ 
+    app = ApplicationBuilder().token(config.BOT_TOKEN).build()
+ 
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CallbackQueryHandler(check_join_callback, pattern=r"^check_"))
+    app.add_handler(MessageHandler(filters.Chat(chat_id=config.PRIVATE_CHANNEL_ID), private_channel_handler))
+ 
+    app.add_error_handler(error_handler)
+ 
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=config.PORT,
+        url_path=config.BOT_TOKEN,
+        webhook_url=f"{config.WEBHOOK_URL}/{config.BOT_TOKEN}",
+    )
+ 
+ 
+if __name__ == "__main__":
+    main()
+ 
