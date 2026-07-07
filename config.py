@@ -16,6 +16,9 @@ MAIN_CHANNEL_LINK = os.environ["MAIN_CHANNEL_LINK"]          # https://t.me/your
 # Channel where user search activity gets logged (bot must be admin here)
 LOG_CHANNEL_ID = int(os.environ["LOG_CHANNEL_ID"])           # e.g. -1004362336237
 
+# Channel where confirmed movie requests get posted (bot must be admin here)
+REQUEST_CHANNEL_ID = int(os.environ["REQUEST_CHANNEL_ID"])   # e.g. -1004475375817
+
 # Comma separated extra force-subscribe channel ids (optional). Main channel is always included.
 _extra = os.environ.get("FORCE_SUB_CHANNEL_IDS", "")
 FORCE_SUB_CHANNEL_IDS = list({MAIN_CHANNEL_ID, *[int(x) for x in _extra.split(",") if x.strip()]})
