@@ -121,6 +121,7 @@ NEW_ARRIVAL_TEXT = "🆕 Latest movie collection vannittundu!"
 
 async def handle_collected_messages(messages: list, context: ContextTypes.DEFAULT_TYPE):
     poster_file_id = None
+    thumb_file_id = None  # fallback: video/document's own auto-generated preview image
     file_id = None
     file_type = None
     raw_caption = None
@@ -133,9 +134,13 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
         elif msg.video:
             file_id = msg.video.file_id
             file_type = "video"
+            if msg.video.thumbnail:
+                thumb_file_id = msg.video.thumbnail.file_id
         elif msg.document:
             file_id = msg.document.file_id
             file_type = "document"
+            if msg.document.thumbnail:
+                thumb_file_id = msg.document.thumbnail.file_id
 
     if not file_id:
         return  # only a poster arrived, nothing to link yet
@@ -152,25 +157,24 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
         InlineKeyboardButton("📥 Get Movie", url=f"https://t.me/{config.BOT_USERNAME}?start={code}")
     ]])
 
+    # IMPORTANT: the main channel post must NEVER contain the actual video
+    # or document — that would let people download the file directly from
+    # the channel, skipping the bot and the force-subscribe check entirely.
+    # The real file is only ever sent by the bot, in DM, after join is
+    # verified (see deliver_file). Here we only ever send an IMAGE
+    # (the admin's poster photo, or the file's own auto-thumbnail) or,
+    # if neither exists, plain text — never send_video/send_document.
+    image_to_use = poster_file_id or thumb_file_id
+
     try:
-        # NOTE: we always use send_photo/send_video/send_document with a
-        # file_id here — never forward_message or copy_message. This makes
-        # every post to the main channel a brand-new message sent by the
-        # bot itself, so Telegram never shows a "Forwarded from" tag, no
-        # matter how the file originally arrived in the private channel.
-        if poster_file_id:
+        if image_to_use:
             await context.bot.send_photo(
-                config.MAIN_CHANNEL_ID, poster_file_id, caption=caption,
-                parse_mode=ParseMode.HTML, reply_markup=button,
-            )
-        elif file_type == "video":
-            await context.bot.send_video(
-                config.MAIN_CHANNEL_ID, file_id, caption=caption,
+                config.MAIN_CHANNEL_ID, image_to_use, caption=caption,
                 parse_mode=ParseMode.HTML, reply_markup=button,
             )
         else:
-            await context.bot.send_document(
-                config.MAIN_CHANNEL_ID, file_id, caption=caption,
+            await context.bot.send_message(
+                config.MAIN_CHANNEL_ID, caption,
                 parse_mode=ParseMode.HTML, reply_markup=button,
             )
     except TelegramError as e:
