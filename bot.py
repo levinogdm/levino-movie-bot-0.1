@@ -80,6 +80,26 @@ async def deliver_file(chat_id: int, code: str, context: ContextTypes.DEFAULT_TY
     )
 
 
+async def log_search(context: ContextTypes.DEFAULT_TYPE, user, query_text: str, found: bool):
+    """Send a log entry to the LOG_CHANNEL_ID every time a user searches for something."""
+    status = "✅ Found" if found else "❌ Not found"
+    username = f"@{user.username}" if user.username else "—"
+    text = (
+        f"🔍 <b>Search Log</b>\n\n"
+        f"👤 Name: {user.first_name}\n"
+        f"🔗 Username: {username}\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"📝 Query: {query_text}\n"
+        f"📊 Status: {status}"
+    )
+    try:
+        await context.bot.send_message(
+            config.LOG_CHANNEL_ID, text, parse_mode=ParseMode.HTML
+        )
+    except TelegramError as e:
+        logger.warning(f"Failed to log to log channel: {e}")
+
+
 # ---------------- Private channel: capture admin uploads ----------------
 # Admin workflow: send the poster PHOTO + the movie VIDEO/DOCUMENT together as one
 # album (select both in Telegram and send at once) to the PRIVATE channel.
@@ -252,6 +272,8 @@ async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 # titles ever posted from the private channel and, if the user has joined
 # the main channel, delivers the matching file the same way deliver_file
 # always does (fresh from the bot, auto-deletes after AUTO_DELETE_SECONDS).
+# Every search (whatever text is typed, movie or not) is also logged to
+# LOG_CHANNEL_ID via log_search().
 
 async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = update.message.text.strip()
@@ -262,6 +284,8 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.add_user(user.id, user.username, user.first_name)
 
     results = db.search_files(query_text)
+    await log_search(context, user, query_text, found=bool(results))
+
     if not results:
         await update.message.reply_text(
             f"😔 '{query_text}' ennu match aavunna movie kandilla.\n\n{config.FOOTER}"
