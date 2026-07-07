@@ -139,6 +139,27 @@ def extract_title(raw_caption: str) -> str:
 NEW_ARRIVAL_TEXT = "🆕 Latest movie collection vannittundu!"
 
 
+async def notify_requesters(title: str, code: str, context: ContextTypes.DEFAULT_TYPE):
+    """After a new file is saved, check if anyone had requested a matching
+    title and DM them directly, then mark their request as fulfilled."""
+    matches = db.get_matching_requests(title)
+    for req in matches:
+        button = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📥 Get Movie", url=f"https://t.me/{config.BOT_USERNAME}?start={code}")
+        ]])
+        try:
+            await context.bot.send_message(
+                req["user_id"],
+                f"🎉 Ningal request cheytha movie ready aayi!\n\n"
+                f"🎬 <b>{title}</b>\n\n{config.FOOTER}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=button,
+            )
+        except TelegramError as e:
+            logger.info(f"Could not DM requester {req['user_id']}: {e}")
+        db.mark_request_fulfilled(req["id"])
+
+
 async def handle_collected_messages(messages: list, context: ContextTypes.DEFAULT_TYPE):
     poster_file_id = None
     thumb_file_id = None  # fallback: video/document's own auto-generated preview image
@@ -210,6 +231,9 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
     except TelegramError as e:
         logger.error(f"Failed to post to main channel: {e}")
 
+    # Notify anyone who had requested a matching title, now that it's live.
+    await notify_requesters(title, code, context)
+
 
 async def private_channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post
@@ -273,7 +297,8 @@ async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 # the main channel, delivers the matching file the same way deliver_file
 # always does (fresh from the bot, auto-deletes after AUTO_DELETE_SECONDS).
 # Every search (whatever text is typed, movie or not) is also logged to
-# LOG_CHANNEL_ID via log_search().
+# LOG_CHANNEL_ID via log_search(). When nothing matches, the user gets a
+# "Request this movie" button (see request_callback below).
 
 async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = update.message.text.strip()
@@ -287,8 +312,13 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await log_search(context, user, query_text, found=bool(results))
 
     if not results:
+        req_id = db.create_request(user.id, query_text)
         await update.message.reply_text(
-            f"😔 '{query_text}' ennu match aavunna movie kandilla.\n\n{config.FOOTER}"
+            f"😔 '{query_text}' ennu match aavunna movie kandilla.\n\n"
+            f"Ee movie venamenkil request cheyyam, kittiyal njan DM ayakkam.\n\n{config.FOOTER}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📩 Request this movie", callback_data=f"reqconfirm_{req_id}")
+            ]]),
         )
         return
 
@@ -336,6 +366,45 @@ async def getfile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await deliver_file(query.message.chat.id, code, context)
 
 
+async def request_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User tapped 'Request this movie' — flip the request to 'requested' and
+    post it to the request channel for the admin to see."""
+    query = update.callback_query
+    req_id = int(query.data.split("reqconfirm_", 1)[1])
+
+    req = db.get_request(req_id)
+    if not req:
+        await query.answer("⚠️ Ee request kandilla.", show_alert=True)
+        return
+
+    if req["status"] == "requested":
+        await query.answer("✅ Already requested cheythathanu!")
+        return
+
+    req = db.confirm_request(req_id)
+    user = query.from_user
+    username = f"@{user.username}" if user.username else "—"
+
+    try:
+        await context.bot.send_message(
+            config.REQUEST_CHANNEL_ID,
+            f"📩 <b>New Movie Request</b>\n\n"
+            f"🎬 Movie: {req['query_text']}\n"
+            f"👤 Name: {user.first_name}\n"
+            f"🔗 Username: {username}\n"
+            f"🆔 ID: <code>{user.id}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as e:
+        logger.warning(f"Failed to post request to request channel: {e}")
+
+    await query.answer("✅ Request submit cheythu!")
+    await query.edit_message_text(
+        f"✅ Request submit cheythu: '{req['query_text']}'\n\n"
+        f"Ee movie kittiyal njan automatic ayi DM ayakkam.\n\n{config.FOOTER}"
+    )
+
+
 # ---------------- Admin commands ----------------
 
 def admin_only(func):
@@ -352,6 +421,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🛠 Admin Panel\n\n"
         "/stats - User & file statistics\n"
+        "/requests - Pending movie requests\n"
         "/broadcast - (reply to a message) send it to all users\n\n"
         f"{config.FOOTER}"
     )
@@ -366,6 +436,18 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎬 Total Files: {stats['files']}\n\n"
         f"{config.FOOTER}"
     )
+
+
+@admin_only
+async def requests_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = db.get_pending_requests()
+    if not pending:
+        await update.message.reply_text(f"📭 Pending requests onnum illa.\n\n{config.FOOTER}")
+        return
+
+    lines = [f"• {r['query_text']} (user: {r['user_id']})" for r in pending]
+    text = "📩 <b>Pending Requests</b>\n\n" + "\n".join(lines) + f"\n\n{config.FOOTER}"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -410,9 +492,11 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("requests", requests_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern=r"^check_"))
     app.add_handler(CallbackQueryHandler(getfile_callback, pattern=r"^getfile_"))
+    app.add_handler(CallbackQueryHandler(request_confirm_callback, pattern=r"^reqconfirm_"))
     app.add_handler(MessageHandler(filters.Chat(chat_id=config.PRIVATE_CHANNEL_ID), private_channel_handler))
     # Any plain text a user sends the bot in DM (not a command) is treated
     # as a movie name search. Must be added AFTER the private-channel
