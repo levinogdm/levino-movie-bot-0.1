@@ -1,5 +1,7 @@
+
 import logging
 import asyncio
+import re
  
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatMemberStatus, ParseMode
@@ -93,6 +95,20 @@ async def process_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE)
         await handle_collected_messages(messages, context)
  
  
+# Removes URLs, @mentions and t.me links from admin captions so that no
+# extra/foreign link ever reaches the main channel post — only the bot's
+# own "Get Movie" button link should be present there.
+URL_PATTERN = re.compile(r"(https?://\S+|t\.me/\S+|www\.\S+|@\w+)", re.IGNORECASE)
+ 
+ 
+def sanitize_title(text: str) -> str:
+    if not text:
+        return "Untitled"
+    cleaned = URL_PATTERN.sub("", text)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -|•\n\t")
+    return cleaned or "Untitled"
+ 
+ 
 async def handle_collected_messages(messages: list, context: ContextTypes.DEFAULT_TYPE):
     poster_file_id = None
     file_id = None
@@ -114,15 +130,23 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
     if not file_id:
         return  # only a poster arrived, nothing to link yet
  
-    title = title or "Untitled"
+    title = sanitize_title(title)
     code = db.save_file(file_id, file_type, title)
  
+    # Caption is built fresh here — it never carries over the original
+    # message's links, mentions, or forward info. Only this text + the
+    # single "Get Movie" button (below) will appear on the main channel post.
     caption = f"🎬 <b>{title}</b>\n\n{config.FOOTER}"
     button = InlineKeyboardMarkup([[
         InlineKeyboardButton("📥 Get Movie", url=f"https://t.me/{config.BOT_USERNAME}?start={code}")
     ]])
  
     try:
+        # NOTE: we always use send_photo/send_video/send_document with a
+        # file_id here — never forward_message or copy_message. This makes
+        # every post to the main channel a brand-new message sent by the
+        # bot itself, so Telegram never shows a "Forwarded from" tag, no
+        # matter how the file originally arrived in the private channel.
         if poster_file_id:
             await context.bot.send_photo(
                 config.MAIN_CHANNEL_ID, poster_file_id, caption=caption,
