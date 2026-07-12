@@ -22,6 +22,24 @@ logger = logging.getLogger(__name__)
 # temporary buffer while collecting album items posted to the private channel
 media_groups: dict[str, list] = {}
 
+# Place a JPG file named exactly this, in the same folder as bot.py, to use
+# as the thumbnail shown whenever the bot delivers a video/document to a
+# user. Telegram requires it to be <=200KB and <=320x320 pixels.
+LOGO_THUMB_PATH = "thumb.jpg"
+_cached_logo_bytes = None
+
+
+def get_logo_thumbnail():
+    global _cached_logo_bytes
+    if _cached_logo_bytes is None:
+        try:
+            with open(LOGO_THUMB_PATH, "rb") as f:
+                _cached_logo_bytes = f.read()
+        except FileNotFoundError:
+            logger.warning(f"{LOGO_THUMB_PATH} not found — files will be sent without a custom thumbnail.")
+            _cached_logo_bytes = b""
+    return _cached_logo_bytes or None
+
 
 # ---------------- Helper functions ----------------
 
@@ -77,17 +95,9 @@ async def deliver_single_file(chat_id: int, title: str, record: dict, context: C
         f"{config.FOOTER}"
     )
 
-    # Use the movie's poster as this file's thumbnail (not just on the main
-    # channel post) so it shows up as the preview image when the user
-    # receives the video/document too. A file_id can't be reused directly as
-    # a thumbnail — it has to be re-uploaded as raw bytes.
-    thumb_bytes = None
-    if poster_file_id:
-        try:
-            tg_file = await context.bot.get_file(poster_file_id)
-            thumb_bytes = bytes(await tg_file.download_as_bytearray())
-        except TelegramError as e:
-            logger.info(f"Could not prepare thumbnail for delivery: {e}")
+    # Fixed bot-logo thumbnail (see LOGO_THUMB_PATH above), shown on every
+    # video/document the bot sends to a user.
+    thumb_bytes = get_logo_thumbnail()
 
     if record["file_type"] == "video":
         sent = await context.bot.send_video(chat_id, record["file_id"], caption=caption, thumbnail=thumb_bytes)
@@ -125,14 +135,22 @@ async def show_quality_menu(chat_id: int, code: str, context: ContextTypes.DEFAU
         [InlineKeyboardButton(quality_button_text(f), callback_data=f"pick_{f['id']}")]
         for f in files
     ]
-    await context.bot.send_message(
-        chat_id,
+    caption = (
         f"📂 <b>Movie Selection:</b> {movie['title']}\n\n"
         f"Multiple quality options are available for this title. "
-        f"Please select your preferred resolution below to start the download.\n\n{config.FOOTER}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(buttons),
+        f"Please select your preferred resolution below to start the download.\n\n{config.FOOTER}"
     )
+    logo_bytes = get_logo_thumbnail()
+    if logo_bytes:
+        await context.bot.send_photo(
+            chat_id, logo_bytes, caption=caption,
+            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    else:
+        await context.bot.send_message(
+            chat_id, caption,
+            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
+        )
 
 
 async def log_search(context: ContextTypes.DEFAULT_TYPE, user, query_text: str, found: bool):
@@ -381,6 +399,16 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
     # Brand new movie
     code = db.create_movie(title, poster_file_id)
     db.add_movie_file(code, file_id, file_type, file_size, quality_label)
+    await log_event(
+        context,
+        f"🆕 <b>New movie created</b>\n\n🎬 {title}\n"
+        f"🔑 Code: <code>{code}</code>\n"
+        f"⚡ Quality: {quality_label or 'not tagged'}\n"
+        f"📦 Size: {format_size(file_size) or 'unknown'}\n\n"
+        f"<i>If you upload another size for this SAME movie and it doesn't "
+        f"say 'Extra file added' in the next log, the titles didn't match — "
+        f"compare the title shown here with the next one.</i>",
+    )
 
     caption = movie_caption(title)
     button = get_movie_button(code)
