@@ -658,7 +658,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛠 Admin Panel\n\n"
         "/stats - User & file statistics\n"
         "/requests - Pending movie requests\n"
-        "/broadcast - (reply to a message) send it to all users\n\n"
+        "/broadcast - (reply to a message) send it to all users\n"
+        "/dm <user_id> <text> - message ONE specific user (or reply + /dm <user_id> for media)\n\n"
         "Private channel commands:\n"
         "• Poster + video/doc with movie name caption → new movie post\n"
         "• Add quality tag (720p/1080p/4K etc.) in caption → shown as an option label\n"
@@ -718,6 +719,55 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@admin_only
+async def dm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a direct message to ONE specific user (not everyone like /broadcast).
+    Usage: /dm <user_id> <message>
+    Or: reply to a photo/video/file with /dm <user_id> to forward that instead."""
+
+    if update.message.reply_to_message:
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: oru message/file-inu reply cheythu:\n/dm <user_id>"
+            )
+            return
+        try:
+            target_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("⚠️ Correct ayittulla user ID kodukkuka (numbers mathram).")
+            return
+
+        try:
+            await update.message.reply_to_message.copy(chat_id=target_id)
+            await update.message.reply_text(f"✅ Send cheythu → user {target_id}")
+        except TelegramError as e:
+            await update.message.reply_text(f"❌ Send cheyyan pattiyilla: {e}")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/dm <user_id> <message text>\n\n"
+            "Allenkil, oru photo/video/file-inu reply cheythu:\n"
+            "/dm <user_id>\n\n"
+            "User ID kittan: /requests command allenkil Log Channel-il ninnu."
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Correct ayittulla user ID kodukkuka (numbers mathram).")
+        return
+
+    text = " ".join(context.args[1:])
+    try:
+        await context.bot.send_message(target_id, text)
+        await update.message.reply_text(f"✅ Send cheythu → user {target_id}")
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ Send cheyyan pattiyilla: {e}")
+
+
 # ---------------- Error handler ----------------
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -736,6 +786,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("requests", requests_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("dm", dm_command))
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern=r"^check_"))
     app.add_handler(CallbackQueryHandler(getfile_callback, pattern=r"^getfile_"))
     app.add_handler(CallbackQueryHandler(pick_callback, pattern=r"^pick_"))
