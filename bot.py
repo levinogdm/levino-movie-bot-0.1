@@ -66,7 +66,7 @@ async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Could not delete message {message_id} in {chat_id}: {e}")
 
 
-async def deliver_single_file(chat_id: int, title: str, record: dict, context: ContextTypes.DEFAULT_TYPE):
+async def deliver_single_file(chat_id: int, title: str, record: dict, context: ContextTypes.DEFAULT_TYPE, poster_file_id: str = None):
     size_text = format_size(record.get("file_size")) or "Unknown size"
     label = record.get("label") or "Download"
 
@@ -77,10 +77,22 @@ async def deliver_single_file(chat_id: int, title: str, record: dict, context: C
         f"{config.FOOTER}"
     )
 
+    # Use the movie's poster as this file's thumbnail (not just on the main
+    # channel post) so it shows up as the preview image when the user
+    # receives the video/document too. A file_id can't be reused directly as
+    # a thumbnail — it has to be re-uploaded as raw bytes.
+    thumb_bytes = None
+    if poster_file_id:
+        try:
+            tg_file = await context.bot.get_file(poster_file_id)
+            thumb_bytes = bytes(await tg_file.download_as_bytearray())
+        except TelegramError as e:
+            logger.info(f"Could not prepare thumbnail for delivery: {e}")
+
     if record["file_type"] == "video":
-        sent = await context.bot.send_video(chat_id, record["file_id"], caption=caption)
+        sent = await context.bot.send_video(chat_id, record["file_id"], caption=caption, thumbnail=thumb_bytes)
     elif record["file_type"] == "document":
-        sent = await context.bot.send_document(chat_id, record["file_id"], caption=caption)
+        sent = await context.bot.send_document(chat_id, record["file_id"], caption=caption, thumbnail=thumb_bytes)
     else:
         sent = await context.bot.send_photo(chat_id, record["file_id"], caption=caption)
 
@@ -106,7 +118,7 @@ async def show_quality_menu(chat_id: int, code: str, context: ContextTypes.DEFAU
         return
 
     if len(files) == 1:
-        await deliver_single_file(chat_id, movie["title"], files[0], context)
+        await deliver_single_file(chat_id, movie["title"], files[0], context, movie.get("poster_file_id"))
         return
 
     buttons = [
@@ -200,16 +212,12 @@ def extract_quality_label(text: str):
     return m.group(0) if m else None
 
 
-def strip_quality(title: str) -> str:
-    cleaned = QUALITY_PATTERN.sub("", title)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -|•\n\t")
-    return cleaned or title
-
-
-# Common junk tokens found in shared movie filenames (codec, source, language,
-# release group, year) that should NOT become part of the movie's title.
+# Common junk tokens found in captions/filenames (codec, source, language,
+# release group, year) that should NOT become part of the movie's title —
+# stripping these consistently, whether the text came from a caption or a
+# raw filename, is what makes "same movie, different size" matching reliable.
 FILENAME_JUNK_PATTERN = re.compile(
-    r"\b(x264|x265|HEVC|AAC|ESub|ESubs|Dual Audio|DDP?5\.1|AMZN|NF|"
+    r"\b(x264|x265|HEVC|AAC|ESub|ESubs|Dual Audio|DDP?5\.1|AMZN|NF|HD ?Print|Print|ORG|"
     r"Hindi|Tamil|Telugu|Malayalam|Kannada|English|"
     r"HDRip|HDCAM|WEB-?DL|WEBRip|BluRay|BRRip|DVDRip|CAM|PreDVD|"
     r"4K|2160p|1440p|1080p|720p|480p|360p|"
@@ -218,18 +226,27 @@ FILENAME_JUNK_PATTERN = re.compile(
 )
 
 
-def clean_filename_title(file_name: str) -> str:
-    """Derive a usable movie title straight from a shared file's own filename
-    (used when the admin forwards a file with NO caption at all)."""
-    if not file_name:
-        return "Untitled"
-    name = re.sub(r"\.\w{2,4}$", "", file_name)          # drop extension
-    name = re.sub(r"[._]+", " ", name)                    # dots/underscores -> spaces
-    name = FILENAME_JUNK_PATTERN.sub("", name)             # strip quality/codec/lang/year junk
-    name = re.sub(r"[\[\](){}]", "", name)                 # stray brackets
-    name = re.sub(r"[-–—]{1,}", " ", name)                 # dashes between junk words
-    name = re.sub(r"\s{2,}", " ", name).strip(" -|•")
-    return name or "Untitled"
+def build_title_and_quality(raw_caption: str, file_name: str):
+    """Works from the caption if there is one, otherwise falls back to the
+    file's own filename — either way the result goes through the same
+    cleanup, so 'Spiderman 720p' (caption) and 'Spiderman.1080p.WEB-DL.mkv'
+    (filename) both normalize down to just 'Spiderman'."""
+    quality_label = extract_quality_label(raw_caption or "") or extract_quality_label(file_name or "")
+
+    source = raw_caption if raw_caption else (file_name or "")
+    first_line = next((line.strip() for line in source.splitlines() if line.strip()), "") if source else ""
+    if not first_line:
+        return "Untitled", quality_label
+
+    cleaned = URL_PATTERN.sub("", first_line)
+    cleaned = EMOJI_PREFIX_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"\.\w{2,4}$", "", cleaned)      # drop file extension, if any
+    cleaned = re.sub(r"[._]+", " ", cleaned)           # dots/underscores -> spaces
+    cleaned = FILENAME_JUNK_PATTERN.sub("", cleaned)   # strip quality/codec/lang/year junk
+    cleaned = re.sub(r"[\[\](){}]", "", cleaned)
+    cleaned = re.sub(r"[-–—]{1,}", " ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -|•")
+    return (cleaned or "Untitled"), quality_label
 
 
 NEW_ARRIVAL_TEXT = "🆕 Latest movie collection vannittundu!"
@@ -342,17 +359,10 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
     if not file_id:
         return  # only a poster arrived, nothing to link yet
 
-    # Prefer the caption for the title/quality. If the admin forwarded the
-    # file with NO caption at all, fall back to the file's own filename
-    # (e.g. "Spiderman.No.Way.Home.1080p.WEB-DL.mkv") so it still works
-    # fully automatically.
-    if raw_caption:
-        raw_title = extract_title(raw_caption)
-        quality_label = extract_quality_label(raw_caption) or extract_quality_label(file_name or "")
-        title = strip_quality(raw_title)
-    else:
-        title = clean_filename_title(file_name or "")
-        quality_label = extract_quality_label(file_name or "")
+    # Same cleanup logic runs whether the title came from the caption or,
+    # if there was no caption at all, from the file's own filename — this
+    # keeps title matching reliable across different-size uploads.
+    title, quality_label = build_title_and_quality(raw_caption, file_name)
 
     existing = db.find_movie_by_title(title)
 
@@ -540,7 +550,10 @@ async def pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     movie = db.get_movie(record["code"])
     await query.answer()
-    await deliver_single_file(query.message.chat.id, movie["title"] if movie else "Movie", record, context)
+    await deliver_single_file(
+        query.message.chat.id, movie["title"] if movie else "Movie", record, context,
+        movie.get("poster_file_id") if movie else None,
+    )
 
 
 async def request_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
