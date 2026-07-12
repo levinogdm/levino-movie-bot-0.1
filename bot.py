@@ -48,35 +48,58 @@ def join_keyboard(code: str) -> InlineKeyboardMarkup:
     ])
 
 
+def format_size(n):
+    if not n:
+        return ""
+    mb = n / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.2f} GB"
+    return f"{mb:.0f} MB"
+
+
 async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id, message_id = context.job.data
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except TelegramError as e:
-        logger.info(f"Could not delete message {message_id} in {chat_id}: {e}")
+    chat_id, message_ids = context.job.data
+    for message_id in message_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramError as e:
+            logger.info(f"Could not delete message {message_id} in {chat_id}: {e}")
 
 
 async def deliver_file(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE):
-    record = db.get_file(code)
-    if not record:
+    """Sends ALL files saved under this movie code (e.g. several sizes/qualities)
+    one after another, then schedules all of them for auto-delete together."""
+    movie = db.get_movie(code)
+    files = db.get_movie_files(code) if movie else []
+
+    if not movie or not files:
         await context.bot.send_message(chat_id, f"⚠️ File kandilla / link expire aayi.\n\n{config.FOOTER}")
         return
 
-    caption = (
-        f"🎬 {record['title']}\n\n"
-        f"⏳ Ee file {config.AUTO_DELETE_SECONDS // 60} minute kazhinjal automatic aayi delete aavum.\n\n"
-        f"{config.FOOTER}"
-    )
+    sent_message_ids = []
+    multi = len(files) > 1
 
-    if record["file_type"] == "video":
-        sent = await context.bot.send_video(chat_id, record["file_id"], caption=caption)
-    elif record["file_type"] == "document":
-        sent = await context.bot.send_document(chat_id, record["file_id"], caption=caption)
-    else:
-        sent = await context.bot.send_photo(chat_id, record["file_id"], caption=caption)
+    for idx, record in enumerate(files, start=1):
+        size_text = format_size(record["file_size"])
+        part_text = f" (Part {idx}/{len(files)})" if multi else ""
+        size_line = f" - {size_text}" if size_text else ""
+        caption = (
+            f"🎬 {movie['title']}{part_text}{size_line}\n\n"
+            f"⏳ Ee file {config.AUTO_DELETE_SECONDS // 60} minute kazhinjal automatic aayi delete aavum.\n\n"
+            f"{config.FOOTER}"
+        )
+
+        if record["file_type"] == "video":
+            sent = await context.bot.send_video(chat_id, record["file_id"], caption=caption)
+        elif record["file_type"] == "document":
+            sent = await context.bot.send_document(chat_id, record["file_id"], caption=caption)
+        else:
+            sent = await context.bot.send_photo(chat_id, record["file_id"], caption=caption)
+
+        sent_message_ids.append(sent.message_id)
 
     context.job_queue.run_once(
-        delete_message_job, config.AUTO_DELETE_SECONDS, data=(chat_id, sent.message_id)
+        delete_message_job, config.AUTO_DELETE_SECONDS, data=(chat_id, sent_message_ids)
     )
 
 
@@ -100,12 +123,26 @@ async def log_search(context: ContextTypes.DEFAULT_TYPE, user, query_text: str, 
         logger.warning(f"Failed to log to log channel: {e}")
 
 
+async def log_event(context: ContextTypes.DEFAULT_TYPE, text: str):
+    try:
+        await context.bot.send_message(config.LOG_CHANNEL_ID, text, parse_mode=ParseMode.HTML)
+    except TelegramError as e:
+        logger.warning(f"Failed to log event: {e}")
+
+
 # ---------------- Private channel: capture admin uploads ----------------
 # Admin workflow: send the poster PHOTO + the movie VIDEO/DOCUMENT together as one
 # album (select both in Telegram and send at once) to the PRIVATE channel.
 # Put the movie name in the photo's caption. The bot links them automatically.
-# (If you only send a video/document with a caption and no separate photo, that
-# file itself is used as the preview in the main channel.)
+#
+# - If the title matches an EXISTING movie (partial/similar match), the new
+#   file is just added as another size/quality under that same movie — NO
+#   new post goes to the main channel.
+# - If it's a brand new title, a new movie is created and posted once.
+# - To update a movie's poster later: send a PHOTO with caption
+#   "/thumb:movie name" to the private channel. The bot finds the matching
+#   movie, deletes its old main-channel post, and posts a fresh one with the
+#   new poster (same Get Movie button/code).
 
 async def process_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.sleep(2)  # give Telegram time to deliver every item in the album
@@ -114,12 +151,9 @@ async def process_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE)
         await handle_collected_messages(messages, context)
 
 
-# Removes URLs, @mentions and t.me links, and only keeps the FIRST LINE of
-# whatever caption the admin sent. This means any promo text, join-channel
-# instructions, or extra lines added below the movie name are dropped
-# completely — only the plain movie name ever reaches the main channel post.
 URL_PATTERN = re.compile(r"(https?://\S+|t\.me/\S+|www\.\S+|@\w+)", re.IGNORECASE)
 EMOJI_PREFIX_PATTERN = re.compile(r"^[\W_]+", re.UNICODE)  # strip leading emoji/symbols like 🎬
+THUMB_CMD_PATTERN = re.compile(r"^/thumb:\s*(.+)$", re.IGNORECASE)
 
 
 def extract_title(raw_caption: str) -> str:
@@ -139,99 +173,152 @@ def extract_title(raw_caption: str) -> str:
 NEW_ARRIVAL_TEXT = "🆕 Latest movie collection vannittundu!"
 
 
+def movie_caption(title: str) -> str:
+    return f"🎬 <b>{title}</b>\n\n{NEW_ARRIVAL_TEXT}\n{config.FOOTER}"
+
+
+def get_movie_button(code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📥 Get Movie", url=f"https://t.me/{config.BOT_USERNAME}?start={code}")
+    ]])
+
+
 async def notify_requesters(title: str, code: str, context: ContextTypes.DEFAULT_TYPE):
-    """After a new file is saved, check if anyone had requested a matching
-    title and DM them directly, then mark their request as fulfilled."""
     matches = db.get_matching_requests(title)
     for req in matches:
-        button = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📥 Get Movie", url=f"https://t.me/{config.BOT_USERNAME}?start={code}")
-        ]])
         try:
             await context.bot.send_message(
                 req["user_id"],
                 f"🎉 Ningal request cheytha movie ready aayi!\n\n"
                 f"🎬 <b>{title}</b>\n\n{config.FOOTER}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=button,
+                reply_markup=get_movie_button(code),
             )
         except TelegramError as e:
             logger.info(f"Could not DM requester {req['user_id']}: {e}")
         db.mark_request_fulfilled(req["id"])
 
 
+async def handle_thumb_command(messages: list, query_title: str, context: ContextTypes.DEFAULT_TYPE):
+    new_poster_id = None
+    for msg in messages:
+        if msg.photo:
+            new_poster_id = msg.photo[-1].file_id
+            break
+
+    if not new_poster_id:
+        await context.bot.send_message(
+            config.PRIVATE_CHANNEL_ID, "⚠️ /thumb command-inu oru photo koodi venam (photo-de caption-il /thumb:MovieName ittu send cheyyuka)."
+        )
+        return
+
+    movie = db.find_movie_by_title(query_title)
+    if not movie:
+        await context.bot.send_message(
+            config.PRIVATE_CHANNEL_ID, f"⚠️ '{query_title}' ennu match aavunna movie kandilla."
+        )
+        return
+
+    if movie.get("main_message_id"):
+        try:
+            await context.bot.delete_message(config.MAIN_CHANNEL_ID, movie["main_message_id"])
+        except TelegramError as e:
+            logger.info(f"Could not delete old main channel message: {e}")
+
+    try:
+        sent = await context.bot.send_photo(
+            config.MAIN_CHANNEL_ID, new_poster_id,
+            caption=movie_caption(movie["title"]),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_movie_button(movie["code"]),
+        )
+        db.update_movie_poster(movie["code"], new_poster_id, sent.message_id)
+        await log_event(context, f"🖼 <b>Thumbnail updated</b>\n\n🎬 {movie['title']}")
+    except TelegramError as e:
+        logger.error(f"Failed to post updated poster: {e}")
+
+
 async def handle_collected_messages(messages: list, context: ContextTypes.DEFAULT_TYPE):
     poster_file_id = None
-    thumb_file_id = None  # fallback: video/document's own auto-generated preview image
+    thumb_file_id = None
     file_id = None
     file_type = None
+    file_size = None
     raw_caption = None
+    thumb_cmd_title = None
 
     for msg in messages:
         if msg.caption:
             raw_caption = msg.caption.strip()
+            m = THUMB_CMD_PATTERN.match(raw_caption)
+            if m:
+                thumb_cmd_title = m.group(1).strip()
         if msg.photo:
             poster_file_id = msg.photo[-1].file_id
         elif msg.video:
             file_id = msg.video.file_id
             file_type = "video"
+            file_size = msg.video.file_size
             if msg.video.thumbnail:
                 thumb_file_id = msg.video.thumbnail.file_id
         elif msg.document:
             file_id = msg.document.file_id
             file_type = "document"
+            file_size = msg.document.file_size
             if msg.document.thumbnail:
                 thumb_file_id = msg.document.thumbnail.file_id
+
+    # ---- /thumb:movie name -> update poster of an existing movie ----
+    if thumb_cmd_title:
+        await handle_thumb_command(messages, thumb_cmd_title, context)
+        return
 
     if not file_id:
         return  # only a poster arrived, nothing to link yet
 
     title = extract_title(raw_caption)
-    code = db.save_file(file_id, file_type, title)
+    existing = db.find_movie_by_title(title)
 
-    # Caption is built fresh here from ONLY the clean title — it never
-    # carries over the original message's promo text, links, mentions, or
-    # forward info. Only this + the single "Get Movie" button will appear
-    # on the main channel post.
-    caption = f"🎬 <b>{title}</b>\n\n{NEW_ARRIVAL_TEXT}\n{config.FOOTER}"
-    button = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📥 Get Movie", url=f"https://t.me/{config.BOT_USERNAME}?start={code}")
-    ]])
+    if existing:
+        # Same movie already posted — just attach this as another size/quality,
+        # do NOT create a new main channel post.
+        db.add_movie_file(existing["code"], file_id, file_type, file_size)
+        await log_event(
+            context,
+            f"➕ <b>Extra file added</b>\n\n🎬 {existing['title']}\n"
+            f"📦 Size: {format_size(file_size) or 'unknown'}",
+        )
+        return
 
-    # IMPORTANT: the main channel post must NEVER contain the actual video
-    # or document — that would let people download the file directly from
-    # the channel, skipping the bot and the force-subscribe check entirely.
-    # The real file is only ever sent by the bot, in DM, after join is
-    # verified (see deliver_file). Here we only ever send an IMAGE
-    # (the admin's poster photo, or the file's own auto-thumbnail) or,
-    # if neither exists, plain text — never send_video/send_document.
+    # Brand new movie
+    code = db.create_movie(title, poster_file_id)
+    db.add_movie_file(code, file_id, file_type, file_size)
+
+    caption = movie_caption(title)
+    button = get_movie_button(code)
+
     try:
         if poster_file_id:
-            # A real poster photo's file_id can be reused directly.
-            await context.bot.send_photo(
+            sent = await context.bot.send_photo(
                 config.MAIN_CHANNEL_ID, poster_file_id, caption=caption,
                 parse_mode=ParseMode.HTML, reply_markup=button,
             )
         elif thumb_file_id:
-            # Telegram does NOT allow a video/document's "thumbnail" file_id
-            # to be reused directly as a photo (different internal file
-            # type), so we download the thumbnail's bytes first and then
-            # upload it fresh as a brand-new photo.
             tg_file = await context.bot.get_file(thumb_file_id)
             photo_bytes = await tg_file.download_as_bytearray()
-            await context.bot.send_photo(
+            sent = await context.bot.send_photo(
                 config.MAIN_CHANNEL_ID, bytes(photo_bytes), caption=caption,
                 parse_mode=ParseMode.HTML, reply_markup=button,
             )
         else:
-            await context.bot.send_message(
+            sent = await context.bot.send_message(
                 config.MAIN_CHANNEL_ID, caption,
                 parse_mode=ParseMode.HTML, reply_markup=button,
             )
+        db.update_movie_message_id(code, sent.message_id)
     except TelegramError as e:
         logger.error(f"Failed to post to main channel: {e}")
 
-    # Notify anyone who had requested a matching title, now that it's live.
     await notify_requesters(title, code, context)
 
 
@@ -292,13 +379,6 @@ async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ---------------- Search by movie name (DM only) ----------------
-# User types a movie name directly to the bot in DM. The bot searches all
-# titles ever posted from the private channel and, if the user has joined
-# the main channel, delivers the matching file the same way deliver_file
-# always does (fresh from the bot, auto-deletes after AUTO_DELETE_SECONDS).
-# Every search (whatever text is typed, movie or not) is also logged to
-# LOG_CHANNEL_ID via log_search(). When nothing matches, the user gets a
-# "Request this movie" button (see request_callback below).
 
 async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = update.message.text.strip()
@@ -308,7 +388,7 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.add_user(user.id, user.username, user.first_name)
 
-    results = db.search_files(query_text)
+    results = db.search_movies(query_text)
     await log_search(context, user, query_text, found=bool(results))
 
     if not results:
@@ -324,7 +404,6 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not await is_joined(context.bot, user.id):
         if len(results) == 1:
-            # Single match — reuse the same join-then-deliver flow as /start deep links.
             await update.message.reply_text(
                 f"⚠️ Ee movie edukkan main channel join cheyyanam.\n\n{config.FOOTER}",
                 reply_markup=join_keyboard(results[0]["code"]),
@@ -367,8 +446,6 @@ async def getfile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def request_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User tapped 'Request this movie' — flip the request to 'requested' and
-    post it to the request channel for the admin to see."""
     query = update.callback_query
     req_id = int(query.data.split("reqconfirm_", 1)[1])
 
@@ -401,7 +478,7 @@ async def request_confirm_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer("✅ Request submit cheythu!")
     await query.edit_message_text(
         f"✅ Request submit cheythu: '{req['query_text']}'\n\n"
-        f"🫠 𝖾𝖾 𝗆𝗈𝗏𝗂𝖾 𝗄𝗂𝗍𝗍𝗂𝗒𝖺𝗅 𝗇𝗃𝖺𝗇 𝖺𝗎𝗍𝗈𝗆𝖺𝗍𝗂𝖼 𝖺𝗒𝗂 📩 𝗗𝗠 𝖺𝗒𝖺𝗄𝗄𝖺𝗆\n\n{config.FOOTER}"
+        f"Ee movie kittiyal njan automatic ayi DM ayakkam.\n\n{config.FOOTER}"
     )
 
 
@@ -423,6 +500,10 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stats - User & file statistics\n"
         "/requests - Pending movie requests\n"
         "/broadcast - (reply to a message) send it to all users\n\n"
+        "Private channel commands:\n"
+        "• Send poster + video/doc with movie name caption → new movie post\n"
+        "• Send another file with a similar movie name → auto-added to same movie, no duplicate post\n"
+        "• Send a photo with caption /thumb:movie name → replaces that movie's poster\n\n"
         f"{config.FOOTER}"
     )
     await update.message.reply_text(text)
@@ -433,7 +514,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = db.get_stats()
     await update.message.reply_text(
         f"👥 Total Users: {stats['users']}\n"
-        f"🎬 Total Files: {stats['files']}\n\n"
+        f"🎬 Total Movies: {stats['movies']}\n"
+        f"📦 Total Files: {stats['files']}\n\n"
         f"{config.FOOTER}"
     )
 
@@ -469,7 +551,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError:
             failed += 1
             db.remove_user(uid)
-        await asyncio.sleep(0.05)  # stay under Telegram's rate limits
+        await asyncio.sleep(0.05)
 
     await status_msg.edit_text(
         f"✅ Broadcast complete.\nSent: {sent}\nFailed/removed: {failed}\n\n{config.FOOTER}"
@@ -498,9 +580,6 @@ def main():
     app.add_handler(CallbackQueryHandler(getfile_callback, pattern=r"^getfile_"))
     app.add_handler(CallbackQueryHandler(request_confirm_callback, pattern=r"^reqconfirm_"))
     app.add_handler(MessageHandler(filters.Chat(chat_id=config.PRIVATE_CHANNEL_ID), private_channel_handler))
-    # Any plain text a user sends the bot in DM (not a command) is treated
-    # as a movie name search. Must be added AFTER the private-channel
-    # handler above so channel posts are never mistaken for a search.
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, search_movie))
 
     app.add_error_handler(error_handler)
