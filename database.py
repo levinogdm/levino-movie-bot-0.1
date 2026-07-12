@@ -1,5 +1,7 @@
 import sqlite3
 import secrets
+import re
+import difflib
 from datetime import datetime, timezone
 
 DB_PATH = "bot_data.db"
@@ -14,12 +16,26 @@ def get_conn():
 def init_db():
     conn = get_conn()
     c = conn.cursor()
+
+    # One row per MOVIE (title + poster + which message this is on the main channel)
     c.execute("""
-        CREATE TABLE IF NOT EXISTS files (
+        CREATE TABLE IF NOT EXISTS movies (
             code TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            poster_file_id TEXT,
+            main_message_id INTEGER,
+            created_at TEXT
+        )
+    """)
+    # One row per FILE belonging to a movie (a movie can have several: different
+    # sizes/qualities). All files under the same movie 'code' get delivered together.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS movie_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
             file_id TEXT NOT NULL,
             file_type TEXT NOT NULL,
-            title TEXT,
+            file_size INTEGER,
             created_at TEXT
         )
     """)
@@ -31,10 +47,6 @@ def init_db():
             joined_at TEXT
         )
     """)
-    # Movie requests: created as 'pending' the instant a search has no match,
-    # then flipped to 'requested' only once the user taps the confirm button
-    # (this avoids spamming the request channel with every failed search).
-    # Once a matching file is uploaded by the admin, status becomes 'fulfilled'.
     c.execute("""
         CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,44 +64,124 @@ def generate_code() -> str:
     return secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
 
 
-def save_file(file_id: str, file_type: str, title: str) -> str:
+# ---------------- Title matching (for "same movie" detection) ----------------
+
+def _normalize(s: str) -> str:
+    return re.sub(r"[^a-z0-9 ]", "", s.lower()).strip()
+
+
+def find_movie_by_title(title: str):
+    """Partial/similar match: returns the best-matching existing movie, or
+    None. A match is either a plain substring overlap (either direction) or
+    a high spelling-similarity ratio, so small typos still match."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM movies")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    target = _normalize(title)
+    if not target:
+        return None
+
+    best_row, best_score = None, 0.0
+    for row in rows:
+        existing = _normalize(row["title"])
+        if not existing:
+            continue
+        if target in existing or existing in target:
+            score = 1.0
+        else:
+            score = difflib.SequenceMatcher(None, target, existing).ratio()
+        if score > best_score:
+            best_score, best_row = score, row
+
+    if best_row and best_score >= 0.72:
+        return best_row
+    return None
+
+
+# ---------------- Movies & files ----------------
+
+def create_movie(title: str, poster_file_id: str = None) -> str:
     conn = get_conn()
     c = conn.cursor()
     while True:
         code = generate_code()
-        c.execute("SELECT 1 FROM files WHERE code=?", (code,))
+        c.execute("SELECT 1 FROM movies WHERE code=?", (code,))
         if not c.fetchone():
             break
     c.execute(
-        "INSERT INTO files (code, file_id, file_type, title, created_at) VALUES (?,?,?,?,?)",
-        (code, file_id, file_type, title, datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO movies (code, title, poster_file_id, main_message_id, created_at) VALUES (?,?,?,?,?)",
+        (code, title, poster_file_id, None, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
     conn.close()
     return code
 
 
-def get_file(code: str):
+def update_movie_message_id(code: str, message_id: int):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT * FROM files WHERE code=?", (code,))
+    c.execute("UPDATE movies SET main_message_id=? WHERE code=?", (message_id, code))
+    conn.commit()
+    conn.close()
+
+
+def update_movie_poster(code: str, poster_file_id: str, main_message_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE movies SET poster_file_id=?, main_message_id=? WHERE code=?",
+        (poster_file_id, main_message_id, code),
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_movie_file(code: str, file_id: str, file_type: str, file_size: int = None):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO movie_files (code, file_id, file_type, file_size, created_at) VALUES (?,?,?,?,?)",
+        (code, file_id, file_type, file_size, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_movie(code: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM movies WHERE code=?", (code,))
     row = c.fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def search_files(query: str, limit: int = 8):
+def get_movie_files(code: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM movie_files WHERE code=? ORDER BY id ASC", (code,))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def search_movies(query: str, limit: int = 8):
     conn = get_conn()
     c = conn.cursor()
     like_query = f"%{query.strip()}%"
     c.execute(
-        "SELECT * FROM files WHERE title LIKE ? ORDER BY created_at DESC LIMIT ?",
+        "SELECT * FROM movies WHERE title LIKE ? ORDER BY created_at DESC LIMIT ?",
         (like_query, limit),
     )
     rows = c.fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
+
+# ---------------- Users ----------------
 
 def add_user(user_id: int, username: str, first_name: str):
     conn = get_conn()
@@ -113,23 +205,25 @@ def get_all_user_ids():
     return [r["user_id"] for r in rows]
 
 
-def get_stats():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) as n FROM users")
-    users = c.fetchone()["n"]
-    c.execute("SELECT COUNT(*) as n FROM files")
-    files = c.fetchone()["n"]
-    conn.close()
-    return {"users": users, "files": files}
-
-
 def remove_user(user_id: int):
     conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
+
+
+def get_stats():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) as n FROM users")
+    users = c.fetchone()["n"]
+    c.execute("SELECT COUNT(*) as n FROM movies")
+    movies = c.fetchone()["n"]
+    c.execute("SELECT COUNT(*) as n FROM movie_files")
+    files = c.fetchone()["n"]
+    conn.close()
+    return {"users": users, "movies": movies, "files": files}
 
 
 # ---------------- Movie requests ----------------
@@ -168,9 +262,6 @@ def confirm_request(req_id: int):
 
 
 def get_matching_requests(title: str):
-    """Find still-open ('requested') requests whose text overlaps the newly
-    uploaded movie's title, in either direction, so close-but-not-identical
-    wording still matches (e.g. request 'KGF 2' vs title 'KGF Chapter 2')."""
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT * FROM requests WHERE status='requested'")
