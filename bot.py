@@ -157,11 +157,14 @@ async def show_quality_menu(chat_id: int, code: str, context: ContextTypes.DEFAU
         f"Multiple quality options are available for this title. "
         f"Please select your preferred resolution below to start the download.\n\n{config.FOOTER}"
     )
-    logo_bytes = get_menu_thumbnail()
+    logo_bytes = get_logo_thumbnail()       # full quality, sent as the document itself
+    preview_bytes = get_menu_thumbnail()     # small square preview shown next to the text
     if logo_bytes:
-        await context.bot.send_photo(
-            chat_id, logo_bytes, caption=caption,
-            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
+        await context.bot.send_document(
+            chat_id, document=logo_bytes, filename="poster.jpg",
+            thumbnail=preview_bytes or logo_bytes,
+            caption=caption, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
     else:
         await context.bot.send_message(
