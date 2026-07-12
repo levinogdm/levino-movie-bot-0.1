@@ -67,17 +67,12 @@ async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def deliver_single_file(chat_id: int, title: str, record: dict, context: ContextTypes.DEFAULT_TYPE):
-    label = record.get("label") or ""
-    size_text = format_size(record.get("file_size"))
-    if label:
-        tag = f" ({label})"
-    elif size_text:
-        tag = f" - {size_text}"
-    else:
-        tag = ""
+    size_text = format_size(record.get("file_size")) or "Unknown size"
+    label = record.get("label") or "Download"
 
     caption = (
-        f"🎬 {title}{tag}\n\n"
+        f"🎬 {title}\n"
+        f"⚡ {size_text} ▪ {label}\n\n"
         f"⏳ Ee file {config.AUTO_DELETE_SECONDS // 60} minute kazhinjal automatic aayi delete aavum.\n\n"
         f"{config.FOOTER}"
     )
@@ -95,9 +90,9 @@ async def deliver_single_file(chat_id: int, title: str, record: dict, context: C
 
 
 def quality_button_text(record: dict) -> str:
-    label = record.get("label") or "Quality"
-    size_text = format_size(record.get("file_size"))
-    return f"⚡ {label} - {size_text}" if size_text else f"⚡ {label}"
+    size_text = format_size(record.get("file_size")) or "Unknown size"
+    label = record.get("label") or "Download"
+    return f"⚡ {size_text} ▪ {label}"
 
 
 async def show_quality_menu(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE):
@@ -211,6 +206,32 @@ def strip_quality(title: str) -> str:
     return cleaned or title
 
 
+# Common junk tokens found in shared movie filenames (codec, source, language,
+# release group, year) that should NOT become part of the movie's title.
+FILENAME_JUNK_PATTERN = re.compile(
+    r"\b(x264|x265|HEVC|AAC|ESub|ESubs|Dual Audio|DDP?5\.1|AMZN|NF|"
+    r"Hindi|Tamil|Telugu|Malayalam|Kannada|English|"
+    r"HDRip|HDCAM|WEB-?DL|WEBRip|BluRay|BRRip|DVDRip|CAM|PreDVD|"
+    r"4K|2160p|1440p|1080p|720p|480p|360p|"
+    r"19\d{2}|20\d{2})\b",
+    re.IGNORECASE,
+)
+
+
+def clean_filename_title(file_name: str) -> str:
+    """Derive a usable movie title straight from a shared file's own filename
+    (used when the admin forwards a file with NO caption at all)."""
+    if not file_name:
+        return "Untitled"
+    name = re.sub(r"\.\w{2,4}$", "", file_name)          # drop extension
+    name = re.sub(r"[._]+", " ", name)                    # dots/underscores -> spaces
+    name = FILENAME_JUNK_PATTERN.sub("", name)             # strip quality/codec/lang/year junk
+    name = re.sub(r"[\[\](){}]", "", name)                 # stray brackets
+    name = re.sub(r"[-–—]{1,}", " ", name)                 # dashes between junk words
+    name = re.sub(r"\s{2,}", " ", name).strip(" -|•")
+    return name or "Untitled"
+
+
 NEW_ARRIVAL_TEXT = "🆕 Latest movie collection vannittundu!"
 
 
@@ -286,6 +307,7 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
     file_id = None
     file_type = None
     file_size = None
+    file_name = None
     raw_caption = None
     thumb_cmd_title = None
 
@@ -301,12 +323,14 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
             file_id = msg.video.file_id
             file_type = "video"
             file_size = msg.video.file_size
+            file_name = getattr(msg.video, "file_name", None)
             if msg.video.thumbnail:
                 thumb_file_id = msg.video.thumbnail.file_id
         elif msg.document:
             file_id = msg.document.file_id
             file_type = "document"
             file_size = msg.document.file_size
+            file_name = msg.document.file_name
             if msg.document.thumbnail:
                 thumb_file_id = msg.document.thumbnail.file_id
 
@@ -318,9 +342,17 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
     if not file_id:
         return  # only a poster arrived, nothing to link yet
 
-    raw_title = extract_title(raw_caption)
-    quality_label = extract_quality_label(raw_caption or "")
-    title = strip_quality(raw_title)
+    # Prefer the caption for the title/quality. If the admin forwarded the
+    # file with NO caption at all, fall back to the file's own filename
+    # (e.g. "Spiderman.No.Way.Home.1080p.WEB-DL.mkv") so it still works
+    # fully automatically.
+    if raw_caption:
+        raw_title = extract_title(raw_caption)
+        quality_label = extract_quality_label(raw_caption) or extract_quality_label(file_name or "")
+        title = strip_quality(raw_title)
+    else:
+        title = clean_filename_title(file_name or "")
+        quality_label = extract_quality_label(file_name or "")
 
     existing = db.find_movie_by_title(title)
 
