@@ -161,7 +161,7 @@ async def show_quality_menu(chat_id: int, code: str, context: ContextTypes.DEFAU
     preview_bytes = get_menu_thumbnail()     # small square preview shown next to the text
     if logo_bytes:
         await context.bot.send_document(
-            chat_id, document=logo_bytes, filename="poster.jpg",
+            chat_id, document=logo_bytes, filename="Medart_hub",
             thumbnail=preview_bytes or logo_bytes,
             caption=caption, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
