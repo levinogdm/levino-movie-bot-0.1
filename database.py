@@ -97,7 +97,7 @@ def find_movie_by_title(title: str):
         if score > best_score:
             best_score, best_row = score, row
 
-    if best_row and best_score >= 0.72:
+    if best_row and best_score >= 0.6:
         return best_row
     return None
 
