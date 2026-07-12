@@ -28,6 +28,11 @@ media_groups: dict[str, list] = {}
 LOGO_THUMB_PATH = "thumb.jpg"
 _cached_logo_bytes = None
 
+# A smaller version (e.g. 100x100px) used only for the quality-selection
+# menu message, so it shows as a small compact preview instead of a big photo.
+MENU_THUMB_PATH = "menu_thumb.jpg"
+_cached_menu_thumb_bytes = None
+
 
 def get_logo_thumbnail():
     global _cached_logo_bytes
@@ -39,6 +44,18 @@ def get_logo_thumbnail():
             logger.warning(f"{LOGO_THUMB_PATH} not found — files will be sent without a custom thumbnail.")
             _cached_logo_bytes = b""
     return _cached_logo_bytes or None
+
+
+def get_menu_thumbnail():
+    global _cached_menu_thumb_bytes
+    if _cached_menu_thumb_bytes is None:
+        try:
+            with open(MENU_THUMB_PATH, "rb") as f:
+                _cached_menu_thumb_bytes = f.read()
+        except FileNotFoundError:
+            logger.warning(f"{MENU_THUMB_PATH} not found — falling back to the bigger logo for the menu.")
+            _cached_menu_thumb_bytes = get_logo_thumbnail() or b""
+    return _cached_menu_thumb_bytes or None
 
 
 # ---------------- Helper functions ----------------
@@ -140,7 +157,7 @@ async def show_quality_menu(chat_id: int, code: str, context: ContextTypes.DEFAU
         f"Multiple quality options are available for this title. "
         f"Please select your preferred resolution below to start the download.\n\n{config.FOOTER}"
     )
-    logo_bytes = get_logo_thumbnail()
+    logo_bytes = get_menu_thumbnail()
     if logo_bytes:
         await context.bot.send_photo(
             chat_id, logo_bytes, caption=caption,
