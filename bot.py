@@ -66,9 +66,43 @@ async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Could not delete message {message_id} in {chat_id}: {e}")
 
 
-async def deliver_file(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE):
-    """Sends ALL files saved under this movie code (e.g. several sizes/qualities)
-    one after another, then schedules all of them for auto-delete together."""
+async def deliver_single_file(chat_id: int, title: str, record: dict, context: ContextTypes.DEFAULT_TYPE):
+    label = record.get("label") or ""
+    size_text = format_size(record.get("file_size"))
+    if label:
+        tag = f" ({label})"
+    elif size_text:
+        tag = f" - {size_text}"
+    else:
+        tag = ""
+
+    caption = (
+        f"🎬 {title}{tag}\n\n"
+        f"⏳ Ee file {config.AUTO_DELETE_SECONDS // 60} minute kazhinjal automatic aayi delete aavum.\n\n"
+        f"{config.FOOTER}"
+    )
+
+    if record["file_type"] == "video":
+        sent = await context.bot.send_video(chat_id, record["file_id"], caption=caption)
+    elif record["file_type"] == "document":
+        sent = await context.bot.send_document(chat_id, record["file_id"], caption=caption)
+    else:
+        sent = await context.bot.send_photo(chat_id, record["file_id"], caption=caption)
+
+    context.job_queue.run_once(
+        delete_message_job, config.AUTO_DELETE_SECONDS, data=(chat_id, [sent.message_id])
+    )
+
+
+def quality_button_text(record: dict) -> str:
+    label = record.get("label") or "Quality"
+    size_text = format_size(record.get("file_size"))
+    return f"⚡ {label} - {size_text}" if size_text else f"⚡ {label}"
+
+
+async def show_quality_menu(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE):
+    """If a movie has only one file, deliver it straight away. If it has
+    several (different sizes/qualities), show a selection menu instead."""
     movie = db.get_movie(code)
     files = db.get_movie_files(code) if movie else []
 
@@ -76,35 +110,25 @@ async def deliver_file(chat_id: int, code: str, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(chat_id, f"⚠️ File kandilla / link expire aayi.\n\n{config.FOOTER}")
         return
 
-    sent_message_ids = []
-    multi = len(files) > 1
+    if len(files) == 1:
+        await deliver_single_file(chat_id, movie["title"], files[0], context)
+        return
 
-    for idx, record in enumerate(files, start=1):
-        size_text = format_size(record["file_size"])
-        part_text = f" (Part {idx}/{len(files)})" if multi else ""
-        size_line = f" - {size_text}" if size_text else ""
-        caption = (
-            f"🎬 {movie['title']}{part_text}{size_line}\n\n"
-            f"⏳ Ee file {config.AUTO_DELETE_SECONDS // 60} minute kazhinjal automatic aayi delete aavum.\n\n"
-            f"{config.FOOTER}"
-        )
-
-        if record["file_type"] == "video":
-            sent = await context.bot.send_video(chat_id, record["file_id"], caption=caption)
-        elif record["file_type"] == "document":
-            sent = await context.bot.send_document(chat_id, record["file_id"], caption=caption)
-        else:
-            sent = await context.bot.send_photo(chat_id, record["file_id"], caption=caption)
-
-        sent_message_ids.append(sent.message_id)
-
-    context.job_queue.run_once(
-        delete_message_job, config.AUTO_DELETE_SECONDS, data=(chat_id, sent_message_ids)
+    buttons = [
+        [InlineKeyboardButton(quality_button_text(f), callback_data=f"pick_{f['id']}")]
+        for f in files
+    ]
+    await context.bot.send_message(
+        chat_id,
+        f"📂 <b>Movie Selection:</b> {movie['title']}\n\n"
+        f"Multiple quality options are available for this title. "
+        f"Please select your preferred resolution below to start the download.\n\n{config.FOOTER}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
 async def log_search(context: ContextTypes.DEFAULT_TYPE, user, query_text: str, found: bool):
-    """Send a log entry to the LOG_CHANNEL_ID every time a user searches for something."""
     status = "✅ Found" if found else "❌ Not found"
     username = f"@{user.username}" if user.username else "—"
     text = (
@@ -116,9 +140,7 @@ async def log_search(context: ContextTypes.DEFAULT_TYPE, user, query_text: str, 
         f"📊 Status: {status}"
     )
     try:
-        await context.bot.send_message(
-            config.LOG_CHANNEL_ID, text, parse_mode=ParseMode.HTML
-        )
+        await context.bot.send_message(config.LOG_CHANNEL_ID, text, parse_mode=ParseMode.HTML)
     except TelegramError as e:
         logger.warning(f"Failed to log to log channel: {e}")
 
@@ -137,7 +159,9 @@ async def log_event(context: ContextTypes.DEFAULT_TYPE, text: str):
 #
 # - If the title matches an EXISTING movie (partial/similar match), the new
 #   file is just added as another size/quality under that same movie — NO
-#   new post goes to the main channel.
+#   new post goes to the main channel. Include a quality tag anywhere in the
+#   caption (480p/720p/1080p/2K/4K/HDRip/WEB-DL/BluRay/CAM) and it will be
+#   shown as the option label; otherwise the file size is shown instead.
 # - If it's a brand new title, a new movie is created and posted once.
 # - To update a movie's poster later: send a PHOTO with caption
 #   "/thumb:movie name" to the private channel. The bot finds the matching
@@ -145,15 +169,19 @@ async def log_event(context: ContextTypes.DEFAULT_TYPE, text: str):
 #   new poster (same Get Movie button/code).
 
 async def process_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE):
-    await asyncio.sleep(2)  # give Telegram time to deliver every item in the album
+    await asyncio.sleep(2)
     messages = media_groups.pop(media_group_id, [])
     if messages:
         await handle_collected_messages(messages, context)
 
 
 URL_PATTERN = re.compile(r"(https?://\S+|t\.me/\S+|www\.\S+|@\w+)", re.IGNORECASE)
-EMOJI_PREFIX_PATTERN = re.compile(r"^[\W_]+", re.UNICODE)  # strip leading emoji/symbols like 🎬
+EMOJI_PREFIX_PATTERN = re.compile(r"^[\W_]+", re.UNICODE)
 THUMB_CMD_PATTERN = re.compile(r"^/thumb:\s*(.+)$", re.IGNORECASE)
+QUALITY_PATTERN = re.compile(
+    r"\b(4K|2160p|1440p|1080p|720p|480p|360p|HDRip|HDCAM|WEB-?DL|WEBRip|BluRay|CAM)\b",
+    re.IGNORECASE,
+)
 
 
 def extract_title(raw_caption: str) -> str:
@@ -168,6 +196,19 @@ def extract_title(raw_caption: str) -> str:
     cleaned = EMOJI_PREFIX_PATTERN.sub("", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -|•\n\t")
     return cleaned or "Untitled"
+
+
+def extract_quality_label(text: str):
+    if not text:
+        return None
+    m = QUALITY_PATTERN.search(text)
+    return m.group(0) if m else None
+
+
+def strip_quality(title: str) -> str:
+    cleaned = QUALITY_PATTERN.sub("", title)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -|•\n\t")
+    return cleaned or title
 
 
 NEW_ARRIVAL_TEXT = "🆕 Latest movie collection vannittundu!"
@@ -208,7 +249,8 @@ async def handle_thumb_command(messages: list, query_title: str, context: Contex
 
     if not new_poster_id:
         await context.bot.send_message(
-            config.PRIVATE_CHANNEL_ID, "⚠️ /thumb command-inu oru photo koodi venam (photo-de caption-il /thumb:MovieName ittu send cheyyuka)."
+            config.PRIVATE_CHANNEL_ID,
+            "⚠️ /thumb command-inu oru photo koodi venam (photo-de caption-il /thumb:MovieName ittu send cheyyuka).",
         )
         return
 
@@ -276,23 +318,27 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
     if not file_id:
         return  # only a poster arrived, nothing to link yet
 
-    title = extract_title(raw_caption)
+    raw_title = extract_title(raw_caption)
+    quality_label = extract_quality_label(raw_caption or "")
+    title = strip_quality(raw_title)
+
     existing = db.find_movie_by_title(title)
 
     if existing:
-        # Same movie already posted — just attach this as another size/quality,
-        # do NOT create a new main channel post.
-        db.add_movie_file(existing["code"], file_id, file_type, file_size)
+        # Same movie already posted — just attach this as another quality
+        # option, do NOT create a new main channel post.
+        db.add_movie_file(existing["code"], file_id, file_type, file_size, quality_label)
         await log_event(
             context,
             f"➕ <b>Extra file added</b>\n\n🎬 {existing['title']}\n"
+            f"⚡ Quality: {quality_label or 'not tagged'}\n"
             f"📦 Size: {format_size(file_size) or 'unknown'}",
         )
         return
 
     # Brand new movie
     code = db.create_movie(title, poster_file_id)
-    db.add_movie_file(code, file_id, file_type, file_size)
+    db.add_movie_file(code, file_id, file_type, file_size, quality_label)
 
     caption = movie_caption(title)
     button = get_movie_button(code)
@@ -362,7 +408,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await deliver_file(update.effective_chat.id, code, context)
+    await show_quality_menu(update.effective_chat.id, code, context)
 
 
 async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -373,7 +419,7 @@ async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if await is_joined(context.bot, user_id):
         await query.answer("✅ Confirm cheythu!")
         await query.message.delete()
-        await deliver_file(query.message.chat.id, code, context)
+        await show_quality_menu(query.message.chat.id, code, context)
     else:
         await query.answer("❌ Ninnal ippozhum channel join cheythittilla!", show_alert=True)
 
@@ -419,7 +465,7 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(results) == 1:
-        await deliver_file(update.effective_chat.id, results[0]["code"], context)
+        await show_quality_menu(update.effective_chat.id, results[0]["code"], context)
         return
 
     buttons = [
@@ -442,7 +488,27 @@ async def getfile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.answer()
-    await deliver_file(query.message.chat.id, code, context)
+    await show_quality_menu(query.message.chat.id, code, context)
+
+
+async def pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User picked a specific quality/size option from the selection menu."""
+    query = update.callback_query
+    file_row_id = int(query.data.split("pick_", 1)[1])
+    user_id = query.from_user.id
+
+    if not await is_joined(context.bot, user_id):
+        await query.answer("❌ Ninnal ippozhum channel join cheythittilla!", show_alert=True)
+        return
+
+    record = db.get_movie_file(file_row_id)
+    if not record:
+        await query.answer("⚠️ File kandilla / expire aayi.", show_alert=True)
+        return
+
+    movie = db.get_movie(record["code"])
+    await query.answer()
+    await deliver_single_file(query.message.chat.id, movie["title"] if movie else "Movie", record, context)
 
 
 async def request_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -501,9 +567,10 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/requests - Pending movie requests\n"
         "/broadcast - (reply to a message) send it to all users\n\n"
         "Private channel commands:\n"
-        "• Send poster + video/doc with movie name caption → new movie post\n"
-        "• Send another file with a similar movie name → auto-added to same movie, no duplicate post\n"
-        "• Send a photo with caption /thumb:movie name → replaces that movie's poster\n\n"
+        "• Poster + video/doc with movie name caption → new movie post\n"
+        "• Add quality tag (720p/1080p/4K etc.) in caption → shown as an option label\n"
+        "• Another file with similar movie name → auto-added as extra quality, no duplicate post\n"
+        "• Photo with caption /thumb:movie name → replaces that movie's poster\n\n"
         f"{config.FOOTER}"
     )
     await update.message.reply_text(text)
@@ -578,6 +645,7 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern=r"^check_"))
     app.add_handler(CallbackQueryHandler(getfile_callback, pattern=r"^getfile_"))
+    app.add_handler(CallbackQueryHandler(pick_callback, pattern=r"^pick_"))
     app.add_handler(CallbackQueryHandler(request_confirm_callback, pattern=r"^reqconfirm_"))
     app.add_handler(MessageHandler(filters.Chat(chat_id=config.PRIVATE_CHANNEL_ID), private_channel_handler))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, search_movie))
