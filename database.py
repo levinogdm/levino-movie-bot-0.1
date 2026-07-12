@@ -36,6 +36,7 @@ def init_db():
             file_id TEXT NOT NULL,
             file_type TEXT NOT NULL,
             file_size INTEGER,
+            label TEXT,
             created_at TEXT
         )
     """)
@@ -139,15 +140,24 @@ def update_movie_poster(code: str, poster_file_id: str, main_message_id: int):
     conn.close()
 
 
-def add_movie_file(code: str, file_id: str, file_type: str, file_size: int = None):
+def add_movie_file(code: str, file_id: str, file_type: str, file_size: int = None, label: str = None):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO movie_files (code, file_id, file_type, file_size, created_at) VALUES (?,?,?,?,?)",
-        (code, file_id, file_type, file_size, datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO movie_files (code, file_id, file_type, file_size, label, created_at) VALUES (?,?,?,?,?,?)",
+        (code, file_id, file_type, file_size, label, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
     conn.close()
+
+
+def get_movie_file(file_row_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM movie_files WHERE id=?", (file_row_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def get_movie(code: str):
