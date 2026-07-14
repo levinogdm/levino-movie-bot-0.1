@@ -26,5 +26,5 @@ FORCE_SUB_CHANNEL_IDS = list({MAIN_CHANNEL_ID, *[int(x) for x in _extra.split(",
 # Comma separated admin telegram user ids, e.g. "123456789,987654321"
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 
-AUTO_DELETE_SECONDS = int(os.environ.get("AUTO_DELETE_SECONDS", 120))
+AUTO_DELETE_SECONDS = int(os.environ.get("AUTO_DELETE_SECONDS", 300))
 FOOTER = "Powered by Levino"
