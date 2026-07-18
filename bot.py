@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import re
+import base64
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatMemberStatus, ParseMode
@@ -76,10 +77,14 @@ async def is_joined(bot, user_id: int) -> bool:
     return True
 
 
-def join_keyboard(code: str) -> InlineKeyboardMarkup:
+def join_keyboard(code: str, title: str = None) -> InlineKeyboardMarkup:
+    check_payload = code
+    if title:
+        # "check_" prefix eats into the 64-byte callback_data budget.
+        check_payload = encode_start_payload(code, title, max_len=64 - len("check_"))
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Join Channel", url=config.MAIN_CHANNEL_LINK)],
-        [InlineKeyboardButton("✅ I've Joined", callback_data=f"check_{code}")],
+        [InlineKeyboardButton("✅ I've Joined", callback_data=f"check_{check_payload}")],
     ])
 
 
@@ -134,14 +139,38 @@ def quality_button_text(record: dict) -> str:
     return f"⚡ {size_text} ▪ {label}"
 
 
-async def show_quality_menu(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE):
+async def show_quality_menu(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE, user_id: int = None, fallback_title: str = None):
     """If a movie has only one file, deliver it straight away. If it has
-    several (different sizes/qualities), show a selection menu instead."""
+    several (different sizes/qualities), show a selection menu instead.
+
+    If the movie/files are missing (e.g. database got wiped on a restart)
+    but a fallback_title was recovered from the button's own link — see
+    decode_start_payload() — a request is created automatically and the
+    user only needs ONE tap to confirm it, no retyping needed."""
     movie = db.get_movie(code)
     files = db.get_movie_files(code) if movie else []
 
     if not movie or not files:
-        await context.bot.send_message(chat_id, f"⚠️ File kandilla / link expire aayi.\n\n{config.FOOTER}")
+        if fallback_title and user_id:
+            req_id = db.create_request(user_id, fallback_title)
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ Ee link expire aayi.\n\n"
+                f"🎬 <b>{fallback_title}</b>\n\n"
+                f"Ee movie request cheyyan thazhe ulla button click cheyyuka, "
+                f"njangal ready aakumbol automatic ayi DM ayakkam.\n\n{config.FOOTER}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📩 Request this movie", callback_data=f"reqconfirm_{req_id}")
+                ]]),
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ Ee link expire aayi / file kandilla.\n\n"
+                f"Ee movie-yude peru type cheythu bot-inu ayakkuka, njangal athu veendum ready aakki "
+                f"ningalkku kittum vidham DM ayakkam.\n\n{config.FOOTER}"
+            )
         return
 
     if len(files) == 1:
@@ -161,7 +190,7 @@ async def show_quality_menu(chat_id: int, code: str, context: ContextTypes.DEFAU
     preview_bytes = get_menu_thumbnail()     # small square preview shown next to the text
     if logo_bytes:
         await context.bot.send_document(
-            chat_id, document=logo_bytes, filename="Medart_hub",
+            chat_id, document=logo_bytes, filename="poster.jpg",
             thumbnail=preview_bytes or logo_bytes,
             caption=caption, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(buttons),
@@ -294,9 +323,51 @@ def movie_caption(title: str) -> str:
     return f"🎬 <b>{title}</b>\n\n{NEW_ARRIVAL_TEXT}\n{config.FOOTER}"
 
 
-def get_movie_button(code: str) -> InlineKeyboardMarkup:
+CODE_LEN = 8  # matches db.generate_code()
+
+
+def _b64_encode(text: str) -> str:
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _b64_decode(data: str) -> str:
+    padded = data + "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+
+
+def encode_start_payload(code: str, title: str, max_len: int = 64) -> str:
+    """CODE + base64(title), so even if the database entry is ever lost, the
+    bot can still recover the movie's title straight from the button/link
+    itself — no DB lookup, no asking the user to retype anything. Telegram
+    limits start payloads (and callback_data) to 64 bytes total, so the
+    title is truncated as needed to fit within max_len."""
+    remaining = max_len - CODE_LEN
+    title_part = title
+    while remaining > 0:
+        encoded = _b64_encode(title_part)
+        if len(encoded) <= remaining:
+            return code + encoded
+        title_part = title_part[:-1]
+    return code  # extremely unlikely fallback: no room for any title chars
+
+
+def decode_start_payload(payload: str):
+    """Returns (code, title_or_None)."""
+    code = payload[:CODE_LEN]
+    title = None
+    rest = payload[CODE_LEN:]
+    if rest:
+        try:
+            title = _b64_decode(rest)
+        except Exception:
+            title = None
+    return code, title
+
+
+def get_movie_button(code: str, title: str) -> InlineKeyboardMarkup:
+    payload = encode_start_payload(code, title)
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📥 Get Movie", url=f"https://t.me/{config.BOT_USERNAME}?start={code}")
+        InlineKeyboardButton("📥 Get Movie", url=f"https://t.me/{config.BOT_USERNAME}?start={payload}")
     ]])
 
 
@@ -309,7 +380,7 @@ async def notify_requesters(title: str, code: str, context: ContextTypes.DEFAULT
                 f"🎉 Ningal request cheytha movie ready aayi!\n\n"
                 f"🎬 <b>{title}</b>\n\n{config.FOOTER}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=get_movie_button(code),
+                reply_markup=get_movie_button(code, title),
             )
         except TelegramError as e:
             logger.info(f"Could not DM requester {req['user_id']}: {e}")
@@ -348,7 +419,7 @@ async def handle_thumb_command(messages: list, query_title: str, context: Contex
             config.MAIN_CHANNEL_ID, new_poster_id,
             caption=movie_caption(movie["title"]),
             parse_mode=ParseMode.HTML,
-            reply_markup=get_movie_button(movie["code"]),
+            reply_markup=get_movie_button(movie["code"], movie["title"]),
         )
         db.update_movie_poster(movie["code"], new_poster_id, sent.message_id)
         await log_event(context, f"🖼 <b>Thumbnail updated</b>\n\n🎬 {movie['title']}")
@@ -431,7 +502,7 @@ async def handle_collected_messages(messages: list, context: ContextTypes.DEFAUL
     )
 
     caption = movie_caption(title)
-    button = get_movie_button(code)
+    button = get_movie_button(code, title)
 
     try:
         if poster_file_id:
@@ -489,27 +560,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(WELCOME_TEXT)
         return
 
-    code = context.args[0]
+    code, fallback_title = decode_start_payload(context.args[0])
 
     if not await is_joined(context.bot, user.id):
         await update.message.reply_text(
             f"⚠️ Ee movie edukkan main channel join cheyyanam.\n\n{config.FOOTER}",
-            reply_markup=join_keyboard(code),
+            reply_markup=join_keyboard(code, fallback_title),
         )
         return
 
-    await show_quality_menu(update.effective_chat.id, code, context)
+    await show_quality_menu(update.effective_chat.id, code, context, user.id, fallback_title)
 
 
 async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    code = query.data.split("check_", 1)[1]
+    payload = query.data.split("check_", 1)[1]
+    code, fallback_title = decode_start_payload(payload)
     user_id = query.from_user.id
 
     if await is_joined(context.bot, user_id):
         await query.answer("✅ Confirm cheythu!")
         await query.message.delete()
-        await show_quality_menu(query.message.chat.id, code, context)
+        await show_quality_menu(query.message.chat.id, code, context, user_id, fallback_title)
     else:
         await query.answer("❌ Ninnal ippozhum channel join cheythittilla!", show_alert=True)
 
@@ -542,7 +614,7 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(results) == 1:
             await update.message.reply_text(
                 f"⚠️ Ee movie edukkan main channel join cheyyanam.\n\n{config.FOOTER}",
-                reply_markup=join_keyboard(results[0]["code"]),
+                reply_markup=join_keyboard(results[0]["code"], results[0]["title"]),
             )
         else:
             await update.message.reply_text(
@@ -555,7 +627,7 @@ async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(results) == 1:
-        await show_quality_menu(update.effective_chat.id, results[0]["code"], context)
+        await show_quality_menu(update.effective_chat.id, results[0]["code"], context, user.id, results[0]["title"])
         return
 
     buttons = [
@@ -578,7 +650,9 @@ async def getfile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.answer()
-    await show_quality_menu(query.message.chat.id, code, context)
+    movie = db.get_movie(code)
+    fallback_title = movie["title"] if movie else None
+    await show_quality_menu(query.message.chat.id, code, context, user_id, fallback_title)
 
 
 async def pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
