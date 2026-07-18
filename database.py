@@ -23,6 +23,7 @@ def init_db():
             code TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             poster_file_id TEXT,
+            thumb_file_id TEXT,
             main_message_id INTEGER,
             created_at TEXT
         )
@@ -62,7 +63,7 @@ def init_db():
 
 
 def generate_code() -> str:
-    return secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
+    return secrets.token_hex(4)  # always exactly 8 hex characters
 
 
 # ---------------- Title matching (for "same movie" detection) ----------------
